@@ -1,13 +1,17 @@
 package forge.web;
 
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 import forge.deck.Deck;
 import forge.game.GameType;
 import forge.game.player.RegisteredPlayer;
 import forge.gamemodes.match.HostedMatch;
 import forge.gui.GuiBase;
+import forge.gui.interfaces.IGuiGame;
 import forge.localinstance.properties.ForgePreferences.FPref;
 import forge.model.FModel;
 import forge.player.GamePlayerUtil;
@@ -83,6 +87,29 @@ public final class MatchBootstrap {
         // startMatch schedules the game on a Forge game thread (GameAction.invoke) and
         // returns; the WebGuiGame receives update callbacks from that thread.
         hosted.startMatch(GameType.Constructed, null, players, humanRp, gui);
+        return hosted;
+    }
+
+    /**
+     * Start a real two-human Constructed match. Each seat carries its own
+     * {@link WebGuiGame} (bound to that browser's WS connection) and deck; Forge drives
+     * both human controllers, each blocking on its own gui's input, with per-player
+     * hidden information (each gui's viewer = its own player via {@code openView}).
+     * Returns immediately; the game runs on its own Forge game thread.
+     */
+    public static HostedMatch startHumanVsHuman(List<BattleLobby.Seat> seats) {
+        ensureInitialized();
+        List<RegisteredPlayer> players = new ArrayList<>(seats.size());
+        Map<RegisteredPlayer, IGuiGame> guis = new LinkedHashMap<>();
+        for (BattleLobby.Seat seat : seats) {
+            Deck d = seat.deck != null ? seat.deck : defaultDeck();
+            RegisteredPlayer rp = new RegisteredPlayer(d);
+            rp.setPlayer(new LobbyPlayerHuman(seat.name != null && !seat.name.isBlank() ? seat.name : "Player"));
+            players.add(rp);
+            guis.put(rp, seat.gui);
+        }
+        HostedMatch hosted = new HostedMatch();
+        hosted.startMatch(GameType.Constructed, null, players, guis);
         return hosted;
     }
 

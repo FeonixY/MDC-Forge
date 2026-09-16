@@ -46,6 +46,7 @@ public class WebMatchServer extends WebSocketServer {
     private static final class Session {
         final WebSocket conn;
         volatile WebGuiGame gui;
+        volatile String room;   // non-null while paired into a PvP battle room
         Session(WebSocket conn) { this.conn = conn; }
     }
 
@@ -71,7 +72,10 @@ public class WebMatchServer extends WebSocketServer {
     @Override
     public void onClose(WebSocket conn, int code, String reason, boolean remote) {
         Session s = sessions.remove(conn);
-        if (s != null && s.gui != null) s.gui.stop(); // concede + free the game thread
+        if (s != null) {
+            if (s.room != null) BattleLobby.leave(s.room, s.gui); // drop a still-waiting seat
+            if (s.gui != null) s.gui.stop(); // concede (in a running match the opponent wins) + free the thread
+        }
         System.out.println("[ws] close: " + conn.getRemoteSocketAddress()
                 + " (" + sessions.size() + " sessions)");
     }
@@ -96,6 +100,10 @@ public class WebMatchServer extends WebSocketServer {
         String id = str(msg.get("id"));
         if ("newgame".equals(id)) {
             startGame(s, str(msg.get("deck")));
+            return;
+        }
+        if ("joinbattle".equals(id)) {
+            joinBattle(s, str(msg.get("room")), str(msg.get("deck")), str(msg.get("name")));
             return;
         }
         WebGuiGame gui = s.gui;
@@ -134,7 +142,43 @@ public class WebMatchServer extends WebSocketServer {
 
     // ---- game lifecycle ----
 
+    /** Join a PvP battle room: park WAITING for an opponent, or start the 2-human match. */
+    private void joinBattle(Session s, String room, String deckText, String name) {
+        if (room == null || room.isBlank()) {
+            trySend(s.conn, Json.write(mapOf("status", "error", "prompt", "缺少房间号")));
+            return;
+        }
+        if (s.gui != null) s.gui.stop();   // fresh gui for this connection
+        WebGuiGame gui = new WebGuiGame();
+        final WebSocket conn = s.conn;
+        gui.setSink(json -> trySend(conn, json));
+        s.gui = gui;
+        s.room = room;
+
+        Deck deck = null;
+        try {
+            deck = DeckParser.parseArena(name != null ? name + " Deck" : "Web Deck", deckText);
+        } catch (Exception e) {
+            System.err.println("[ws] battle deck parse failed: " + e);
+        }
+        try {
+            BattleLobby.Result r = BattleLobby.join(room, gui, deck, name);
+            System.out.println("[ws] joinbattle room=" + room + " name=" + name + " -> " + r);
+            if (r == BattleLobby.Result.WAITING) {
+                trySend(conn, Json.write(mapOf("status", "waiting", "prompt", "已进入牌桌，等待对手加入…")));
+            } else if (r == BattleLobby.Result.FULL) {
+                s.room = null; gui.stop(); s.gui = null;
+                trySend(conn, Json.write(mapOf("status", "error", "prompt", "该对战房已开始或已满")));
+            }
+            // STARTED: the engine pushes real game frames to both guis; nothing to send here.
+        } catch (Exception e) {
+            e.printStackTrace();
+            trySend(conn, Json.write(mapOf("status", "error", "prompt", "开局失败：" + e)));
+        }
+    }
+
     private void startGame(Session s, String deckText) {
+        s.room = null;
         // Tear down any previous game for this connection (new game / reconnect).
         if (s.gui != null) s.gui.stop();
 
