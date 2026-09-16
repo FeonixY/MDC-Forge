@@ -47,6 +47,7 @@ public class WebMatchServer extends WebSocketServer {
         final WebSocket conn;
         volatile WebGuiGame gui;
         volatile String room;   // non-null while paired into a PvP battle room
+        volatile String uid;    // player identity for reconnect matching
         Session(WebSocket conn) { this.conn = conn; }
     }
 
@@ -73,8 +74,13 @@ public class WebMatchServer extends WebSocketServer {
     public void onClose(WebSocket conn, int code, String reason, boolean remote) {
         Session s = sessions.remove(conn);
         if (s != null) {
-            if (s.room != null) BattleLobby.leave(s.room, s.gui); // drop a still-waiting seat
-            if (s.gui != null) s.gui.stop(); // concede (in a running match the opponent wins) + free the thread
+            if (s.room != null) {
+                // PvP: keep the match alive; a running seat gets a grace window to reconnect,
+                // a still-waiting seat is dropped. Never stop the gui here.
+                BattleLobby.onDisconnect(s.room, s.uid);
+            } else if (s.gui != null) {
+                s.gui.stop(); // vs-AI: concede + free the game thread
+            }
         }
         System.out.println("[ws] close: " + conn.getRemoteSocketAddress()
                 + " (" + sessions.size() + " sessions)");
@@ -103,7 +109,15 @@ public class WebMatchServer extends WebSocketServer {
             return;
         }
         if ("joinbattle".equals(id)) {
-            joinBattle(s, str(msg.get("room")), str(msg.get("deck")), str(msg.get("name")));
+            joinBattle(s, str(msg.get("room")), str(msg.get("uid")), str(msg.get("deck")), str(msg.get("name")));
+            return;
+        }
+        if ("surrender".equals(id)) {
+            BattleLobby.surrender(s.room, s.uid, "对手投降,你获胜");
+            return;
+        }
+        if ("leaveroom".equals(id)) {
+            BattleLobby.surrender(s.room, s.uid, "对手离开,本场结束");
             return;
         }
         WebGuiGame gui = s.gui;
@@ -142,18 +156,16 @@ public class WebMatchServer extends WebSocketServer {
 
     // ---- game lifecycle ----
 
-    /** Join a PvP battle room: park WAITING for an opponent, or start the 2-human match. */
-    private void joinBattle(Session s, String room, String deckText, String name) {
+    /** Join (or reconnect to) a PvP battle room. BattleLobby owns gui lifecycle across reconnects. */
+    private void joinBattle(Session s, String room, String uid, String deckText, String name) {
         if (room == null || room.isBlank()) {
             trySend(s.conn, Json.write(mapOf("status", "error", "prompt", "缺少房间号")));
             return;
         }
-        if (s.gui != null) s.gui.stop();   // fresh gui for this connection
-        WebGuiGame gui = new WebGuiGame();
+        if (s.gui != null && s.room == null) s.gui.stop();   // drop a prior vs-AI game on this connection
         final WebSocket conn = s.conn;
-        gui.setSink(json -> trySend(conn, json));
-        s.gui = gui;
-        s.room = room;
+        WebGuiGame.Sink sink = json -> trySend(conn, json);
+        s.room = room; s.uid = uid;
 
         Deck deck = null;
         try {
@@ -162,15 +174,16 @@ public class WebMatchServer extends WebSocketServer {
             System.err.println("[ws] battle deck parse failed: " + e);
         }
         try {
-            BattleLobby.Result r = BattleLobby.join(room, gui, deck, name);
-            System.out.println("[ws] joinbattle room=" + room + " name=" + name + " -> " + r);
-            if (r == BattleLobby.Result.WAITING) {
+            BattleLobby.Result r = BattleLobby.join(room, uid, name, deck, sink);
+            s.gui = r.gui;   // route this connection's actions to its seat's gui
+            System.out.println("[ws] joinbattle room=" + room + " uid=" + uid + " name=" + name + " -> " + r.kind);
+            if (r.kind == BattleLobby.Result.Kind.WAITING) {
                 trySend(conn, Json.write(mapOf("status", "waiting", "prompt", "已进入牌桌，等待对手加入…")));
-            } else if (r == BattleLobby.Result.FULL) {
-                s.room = null; gui.stop(); s.gui = null;
-                trySend(conn, Json.write(mapOf("status", "error", "prompt", "该对战房已开始或已满")));
+            } else if (r.kind == BattleLobby.Result.Kind.FULL) {
+                s.room = null; s.uid = null; s.gui = null;
+                trySend(conn, Json.write(mapOf("status", "error", "prompt", "该对战房已满或已结束")));
             }
-            // STARTED: the engine pushes real game frames to both guis; nothing to send here.
+            // STARTED / RECONNECTED: setSink pushes the current state; nothing else to send here.
         } catch (Exception e) {
             e.printStackTrace();
             trySend(conn, Json.write(mapOf("status", "error", "prompt", "开局失败：" + e)));
