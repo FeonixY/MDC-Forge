@@ -22,6 +22,7 @@ public final class BridgeApp {
 
     public static void main(String[] args) throws Exception {
         System.setProperty("java.awt.headless", "true");
+        enableLineFlushedStdout();
 
         String host = firstNonEmpty(
                 args.length > 0 ? args[0] : null,
@@ -52,6 +53,21 @@ public final class BridgeApp {
 
         // Keep the JVM alive.
         Thread.currentThread().join();
+    }
+
+    /**
+     * Make stdout flush per line. Under systemd, stdout is a pipe to journald, and the JVM
+     * block-buffers non-console streams: output sits in the buffer until it fills (8 KB), so a
+     * long-running bridge shows nothing in the journal until it happens to produce a burst. That
+     * leaves no trace to debug a process that misbehaves without crashing. Buffered underneath so
+     * we still don't syscall per write; autoflush turns every println into a flush.
+     * UTF-8 is explicit so Chinese card names survive regardless of the platform default.
+     */
+    private static void enableLineFlushedStdout() {
+        System.setOut(new java.io.PrintStream(
+                new java.io.BufferedOutputStream(
+                        new java.io.FileOutputStream(java.io.FileDescriptor.out), 8192),
+                true, java.nio.charset.StandardCharsets.UTF_8));
     }
 
     /** Pin the headless Swing EDT alive so input-setup tasks always have a live dispatcher. */
